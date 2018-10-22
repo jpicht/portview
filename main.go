@@ -3,10 +3,9 @@ package main
 import (
 	"fmt"
 	"log"
-	"os"
-	"text/template"
 	"time"
 
+	"github.com/davecgh/go-spew/spew"
 	"github.com/jpicht/ethtool"
 	"github.com/jpicht/gopacket"
 	"github.com/jpicht/gopacket/layers"
@@ -16,6 +15,7 @@ import (
 
 var (
 	device            = "eth0"
+	outputFile        string
 	captureBufferSize = 1024
 	promiscuous       = true
 	err               error
@@ -23,60 +23,9 @@ var (
 	handle            *pcap.Handle
 )
 
-const NoLinkTemplate = `
-<html>
-<head><meta http-equiv="refresh" content="1"></head>
-<style>
-body {
-	font-size: 200%;
-}
-</style>
-<body>
-<h1>NO LINK</h1>
-<h3>{{.Ts}}</h3>
-</body>
-</html>
-`
-
-const CDPTemplate = `
-<html>
-<head><meta http-equiv="refresh" content="1"></head>
-<style>
-body {
-	font-size: 200%;
-}
-</style>
-<body>
-<h1>CDP v{{.CDP.CDPHello.Version}}</h1>
-<h3>{{.Ts}}</h3>
-<h2>Switch: {{.CDP.DeviceID}}<br>
-Port: {{.CDP.PortID}}</h2>
-<h2>{{.CDP.Platform}}</h2>
-<pre>{{.CDP.Version}}</pre>
-</body>
-</html>
-`
-
-var (
-	tplCdp, _    = template.New("").Parse(CDPTemplate)
-	tplNoLink, _ = template.New("").Parse(NoLinkTemplate)
-)
-
-func render(tpl *template.Template, t interface{}) {
-	f, _ := os.OpenFile(
-		"/var/www/html/portview/temp.html",
-		os.O_CREATE|os.O_TRUNC|os.O_WRONLY,
-		os.FileMode(0644),
-	)
-	defer func() {
-		f.Close()
-		os.Rename("/var/www/html/portview/temp.html", "/var/www/html/portview/index.html")
-	}()
-	tpl.Execute(f, t)
-}
-
 func main() {
 	flag.StringVarP(&device, "device", "d", "eth0", "Device to capture")
+	flag.StringVarP(&outputFile, "output", "o", "/var/www/html/portview/index.html", "HTML output file")
 	flag.IntVarP(&captureBufferSize, "capture-buffer", "b", 1024*1024, "Capture buffer size")
 	flag.StringVarP(&timeout, "timeout", "t", "100ms", "Maximum time waiting for the buffer to be filled")
 	flag.Parse()
@@ -108,59 +57,85 @@ func main() {
 		panic(err.Error())
 	}
 
+	o := NewOutput(outputFile)
+
 	go func() {
-		for range time.NewTicker(1 * time.Second).C {
+		ticker := time.NewTicker(1 * time.Second)
+		for {
 			// Retrieve tx from eth0
 			link, err := ethHandle.LinkStatus(device)
 			if err != nil {
 				panic(err.Error())
 			}
-			if !link {
-				render(tplNoLink, struct {
-					Ts string
-				}{time.Now().String()})
-			}
+			o.SetLinkState(link)
+			<-ticker.C
 		}
 	}()
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
-	fmt.Println(handle.LinkType().String())
 	for packet := range packetSource.Packets() {
-		//fmt.Println("--- PACKET ---")
 		for _, layer := range packet.Layers()[2:] {
-			//fmt.Printf("--- LAYER %d ---\n", layerNum+2)
-			//fmt.Println(reflect.TypeOf(layer))
-			handleLayer(layer)
-			//fmt.Println(gopacket.LayerDump(layer))
+			handleLayer(o, layer)
 		}
 	}
 }
 
-func handleLayer(l gopacket.Layer) {
+func handleLayer(o Output, l gopacket.Layer) {
 	switch t := l.(type) {
-	case *layers.STP:
-		return
-		// spew.Dump(t)
+	case *layers.CiscoDiscovery:
+		o.SetCiscoTTL(time.Duration(uint8(t.TTL)) * time.Second)
 	case *layers.CiscoDiscoveryInfo:
-		// spew.Dump(t)
-		//FIXME
-		render(tplCdp, struct {
-			CDP *layers.CiscoDiscoveryInfo
-			Ts  string
-		}{t, time.Now().String()})
+		o.SetCiscoDiscoveryInfo(t)
 		fmt.Print("--- CDP")
 		fmt.Printf(" Version %d\n", t.CDPHello.Version)
 		fmt.Printf(" Device: %s\n", t.DeviceID)
 		fmt.Printf(" Port  : %s\n", t.PortID)
 		fmt.Printf(" IPs   : %s\n", t.Addresses)
-		/*
-			fmt.Printf(" VLAN  : native: %d\n", t.NativeVLAN)
-			if t.FullDuplex {
-				fmt.Println(" Duplex: FULL")
-			} else {
-				fmt.Println(" Duplex: HALF")
+	case *layers.DHCPv4:
+		switch t.Operation {
+		case layers.DHCPOpRequest:
+			fmt.Println("--- DHCP REQUEST")
+			fmt.Printf(" Source  : %s (%s)\n", t.ClientHWAddr, t.ClientIP)
+			for _, opt := range t.Options {
+				switch opt.Type {
+				case layers.DHCPOptHostname:
+					fmt.Printf(" Hostname: %s\n", opt.Data)
+					o.AddDHCPHost(string(opt.Data))
+				}
 			}
+		case layers.DHCPOpReply:
+			fmt.Println("--- DHCP REPLY")
+		}
+	case *layers.DHCPv6:
+	case *layers.DNS:
+	case *layers.ICMPv4:
+		// sublayers not implemented in lib
+	case *layers.ICMPv6:
+	case *layers.ICMPv6RouterSolicitation:
+		/* weird stuff happening, not decoded correctly
+		for _, opt := range t.Options {
+			switch opt.Type {
+			case layers.ICMPv6OptSourceAddress:
+				o.AddIPv6Neighbour(opt.Data)
+			}
+		}
 		*/
+	case *layers.ICMPv6NeighborSolicitation:
+		o.AddIPv6Neighbour(t.TargetAddress)
+	case *layers.IPv6HopByHop:
+	case *layers.MLDv2MulticastListenerReportMessage:
+	case *layers.NTP:
+	case *layers.SNAP:
+	case *layers.STP:
+		// TODO
+	case *layers.TCP:
+	case *layers.UDP:
+
 	default:
+		fmt.Print("--- PACKET")
+		spew.Dump(t)
+
+	case *gopacket.DecodeFailure:
+	case *gopacket.Payload:
 	}
 }

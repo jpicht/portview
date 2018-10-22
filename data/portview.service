@@ -1,0 +1,12 @@
+[Unit]
+Description=PortView daemon
+After=syslog.target network.target
+
+[Service]
+Type=simple
+ExecStartPre=/sbin/ip link set dev eth0 up
+ExecStart=/home/pi/go/bin/portview
+ExecStop=kill portview
+
+[Install]
+WantedBy=multi-user.target
